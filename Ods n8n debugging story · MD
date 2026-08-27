@@ -1,0 +1,85 @@
+The Case of the Missing Connection: An ODS + n8n Debugging Story
+
+A field guide disguised as a story, for anyone wiring n8n into an ODS stack.
+
+Chapter 1: The Wrong Name for the Right Thing
+
+It started simply enough: llama.cpp running in a Docker container, port 11434 open in the browser. Easy, right? Point n8n at localhost:11434 and go.
+
+Except the browser and n8n live in two different worlds. The browser sits on the host machine, looking in through a window Docker cut in the wall — the published port. n8n, on the other hand, lives inside its own container, on its own street, in a neighborhood called the Docker network. From n8n's point of view, localhost doesn't mean "the machine" — it means "myself." Asking n8n to reach localhost:11434 was like asking someone to visit a neighbor by knocking on their own front door.
+
+Lesson #1: A port that works in your browser and a port that works from inside another container are not the same address, even when the number matches.
+
+There was a second twist hiding in this first clue: port 11434 is Ollama's calling card, not llama.cpp's. It turned out ODS had simply mapped llama.cpp's server onto that familiar port for convenience — under the hood, it was still speaking the OpenAI-compatible dialect, not Ollama's native tongue. So the n8n Ollama node was the wrong tool for the job. The right one was the OpenAI Chat Model node, pointed at /v1.
+
+Chapter 2: docker ps Cracks the Case Wide Open
+
+Rather than keep guessing hostnames, the real breakthrough came from one command:
+
+bash
+docker ps
+
+There it was — the whole cast of characters, laid bare:
+
+ods-llama-server   0.0.0.0:11434->8080/tcp
+ods-litellm        0.0.0.0:4000->4000/tcp
+ods-searxng        0.0.0.0:8888->8080/tcp
+
+The arrow (->) was the key to the whole mystery. Everything on the left of the arrow is the host's doorway — what your browser sees. Everything on the right is the container's actual internal address — what other containers, like n8n, must use to knock correctly.
+
+Lesson #2: docker ps always tells the truth. When in doubt, read the arrow.
+
+Chapter 3: The Locked Door at LiteLLM
+
+Next, LiteLLM's admin UI appeared — polished, official-looking, guarded by a login screen. "admin / admin" seemed like a reasonable guess. It wasn't.
+
+The truth was hiding in plain sight in a .env file the whole time: LiteLLM's password isn't a default at all — it's whatever MASTER_KEY was generated at install. A quick Get-Content .env | Select-String "MASTER_KEY" and the door swung open. From there, minting an actual API key for n8n (rather than reusing the master key) was one click away in the Keys panel.
+
+Lesson #3: "Default credentials" and "your actual credentials" are not always the same thing. Check the .env before assuming anything is broken.
+
+And once inside, the same Chapter 1 lesson repeated itself, right on schedule: http://ods-litellm:4000 worked perfectly for n8n, but sat there doing nothing when typed into a browser — because a browser isn't a container, and never will be. localhost:4000 was needed instead. Same story, different service.
+
+Chapter 4: The Silent Tool
+
+With SearXNG wired up as a tool for the AI Agent, everything looked configured — until the agent complained:
+
+"No parameters are set up to be filled by AI."
+
+This wasn't a networking problem at all — it was a permissions problem, of a sort. The Query field on the SearXNG Tool node was sitting there, static and unhelpful, waiting to be told it was allowed to think for itself. A single click on the ✨ icon changed everything: the field transformed into $fromAI('Query', ...), and suddenly the agent could hand it a real search term at runtime.
+
+Lesson #4: An AI Agent can only control the fields it's explicitly given permission to control. The sparkle icon is that permission slip.
+
+Chapter 5: fetch failed — The Vaguest Clue of All
+
+Then came the trickiest error of the whole investigation: fetch failed. No status code, no helpful message — just silence where a response should have been.
+
+The investigation went methodically:
+
+Was n8n on the same Docker network as SearXNG? Yes — docker network inspect confirmed it.
+Was SearXNG's settings.yml set to allow JSON output, not just HTML? Yes — already configured.
+Was the limiter or bot-detection blocking the request? No — limiter: false.
+
+Every obvious suspect had an alibi. So the logs were called as the final witness:
+
+[INFO] Listening at: http://:::8080
+
+And there was the answer, quietly confessing the entire time: SearXNG was listening on 8080 inside its own container. Port 8888 — the number everyone had been using — only existed on the host side of the mapping, exactly like ods-llama-server's 11434 had turned out to be a host-side alias for internal port 8080.
+
+Swapping the credential URL to http://ods-searxng:8080 fixed it instantly.
+
+Lesson #5: The same mistake can hide behind different symptoms. Chapter 1's lesson — host port ≠ container port — was the answer all along; it just wore a scarier disguise this time.
+
+Epilogue: The Playbook
+
+By the end, one rule explained every single mystery in this story:
+
+A container talks to another container using the container's name and its internal port. A browser on the host talks to a container using localhost and the published port. Never mix the two.
+
+The cheat sheet
+Service	From your browser (host)	From n8n (container)
+llama-server	localhost:11434	http://ods-llama-server:8080
+LiteLLM	localhost:4000	http://ods-litellm:4000
+SearXNG	localhost:8888	http://ods-searxng:8080
+The one command that answers almost everything
+bash
+docker ps --format "table {{.Names}}\t{{.Ports}}"

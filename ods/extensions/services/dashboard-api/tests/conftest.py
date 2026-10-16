@@ -38,6 +38,51 @@ if "fcntl" not in sys.modules:
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
+@pytest.fixture
+def mock_edge_read_transport(monkeypatch):
+    """Reuse the existing fake HTTP client in legacy handler-only tests."""
+    import httpx
+    import pixel_edge_read_client
+    from routers import pixel
+
+    original_factory = httpx.AsyncClient
+    clients = {}
+
+    def get_fake():
+        factory = httpx.AsyncClient
+        assert factory is not original_factory, 'Handler test must provide a fake edge transport'
+        if factory not in clients:
+            clients[factory] = factory()
+        return clients[factory]
+
+    monkeypatch.setattr(pixel, 'get_edge_read_client', get_fake)
+    monkeypatch.setattr(pixel_edge_read_client, 'get_edge_read_client', get_fake)
+
+
+@pytest.fixture(autouse=True)
+def _no_hugging_face_header_reads(monkeypatch):
+    """Unit tests never reach Hugging Face; a test that needs a header stubs one."""
+    import hf_gguf_header
+
+    async def unreachable(*_args, **_kwargs):
+        raise hf_gguf_header.HeaderUnavailable("unreachable", "unit tests do not read Hugging Face")
+
+    monkeypatch.setattr(hf_gguf_header, "fetch_gguf_header", unreachable)
+
+
+@pytest.fixture(autouse=True)
+def _no_runtime_probe_requests(monkeypatch):
+    """Unit tests never probe a real llama-server (a developer machine may run one on
+    127.0.0.1:8080). Every loaded copy of the host agent gets an unreachable runtime;
+    a test that exercises the probes stubs ``_runtime_exchange`` itself."""
+    def unreachable(*_args, **_kwargs):
+        raise OSError("unit tests do not probe a real runtime")
+
+    for module in list(sys.modules.values()):
+        if getattr(module, "_profile_model", None) is not None and hasattr(module, "_runtime_exchange"):
+            monkeypatch.setattr(module, "_runtime_exchange", unreachable)
+
+
 @pytest.fixture()
 def install_dir(tmp_path, monkeypatch):
     """Provide an isolated install directory with a .env file."""

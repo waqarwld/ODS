@@ -108,6 +108,23 @@ case "${DOCKER_STUB_MODE:-success}" in
         echo "Container ods-llama-server started"
         exit 0
         ;;
+    fail-wsl-runtime-once)
+        state_file="$TMPDIR_TEST/wsl-runtime-retry-count"
+        count=0
+        [[ -f "$state_file" ]] && count=$(cat "$state_file")
+        count=$((count + 1))
+        echo "$count" > "$state_file"
+        if [[ "$count" -eq 1 ]]; then
+            echo "failed to create task for container: OCI runtime create failed: unable to start container process: unable to start unit docker-deadbeef.scope: Message recipient disconnected from message bus without replying: unknown"
+            exit 1
+        fi
+        echo "Container ods-llama-server started"
+        exit 0
+        ;;
+    fail-wsl-runtime-always)
+        echo "failed to create task for container: OCI runtime create failed: unable to start container process: unable to start unit docker-deadbeef.scope: Message recipient disconnected from message bus without replying: unknown"
+        exit 1
+        ;;
     fail-startup-twice-then-name-conflict)
         state_file="$TMPDIR_TEST/startup-retry-count"
         count=0
@@ -186,6 +203,8 @@ teardown() {
     # At least one error-keyword line should be surfaced (indented two spaces).
     assert_output --partial "Error response from daemon"
     assert_output --partial "Full compose output:"
+    # A failed start/restart/update points at help (round G).
+    assert_output --partial "https://discord.gg/4ntNp9MAwC"
 }
 
 @test "wrapper: failure propagates the compose exit code (1)" {
@@ -307,6 +326,27 @@ teardown() {
     assert_output --partial "retrying (2/2)"
     assert_output --partial "Restarting all services"
     assert_output --partial "done"
+    run grep -c '^DOCKER_ARGS:' "$DOCKER_CALL_LOG"
+    assert_output "3"
+}
+
+@test "wrapper: compose up retries a transient WSL systemd runtime startup failure" {
+    export DOCKER_STUB_MODE=fail-wsl-runtime-once
+    run _compose_run_with_summary "Restarting all services" up -d
+    assert_success
+    assert_output --partial "Docker reported a transient service startup failure"
+    run grep -c '^DOCKER_ARGS:' "$DOCKER_CALL_LOG"
+    assert_output "2"
+}
+
+@test "wrapper: persistent WSL systemd runtime startup failure exhausts retries" {
+    export DOCKER_STUB_MODE=fail-wsl-runtime-always
+    export ODS_COMPOSE_STARTUP_RETRY_ATTEMPTS=3
+    run _compose_run_with_summary "Restarting all services" up -d
+    assert_failure
+    assert_output --partial "retrying (1/2)"
+    assert_output --partial "retrying (2/2)"
+    assert_output --partial "Restarting all services failed"
     run grep -c '^DOCKER_ARGS:' "$DOCKER_CALL_LOG"
     assert_output "3"
 }

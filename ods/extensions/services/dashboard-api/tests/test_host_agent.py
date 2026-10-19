@@ -29,6 +29,39 @@ sys.modules["ods_host_agent"] = _mod
 _spec.loader.exec_module(_mod)
 
 
+@pytest.mark.parametrize("kind", ["apply", "proof"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_remote_provider_publishes_busy_state_until_request_settles(monkeypatch, kind, fails):
+    """Navigating to Models must not offer recovery during a provider switch."""
+    monkeypatch.setattr(_mod, "check_auth", lambda _handler: True)
+    monkeypatch.setattr(_mod, "_plan_remote_provider_lifecycle_operation", lambda _body: {"action": "disable"})
+    observed = []
+
+    def work(*_args):
+        observed.append(_mod._model_lifecycle_status())
+        recovery = _FakeHandler(b"{}")
+        _mod.AgentHandler._handle_model_recover(recovery)
+        assert recovery.response_code == 409
+        if fails:
+            raise RuntimeError("provider unavailable")
+        return {"applied": True}
+
+    monkeypatch.setattr(_mod, "_apply_remote_provider_lifecycle_operation", work)
+    monkeypatch.setattr(_mod, "_record_remote_provider_egress_probe", work)
+    handler = _FakeHandler(b'{"action":"disable"}')
+    getattr(_mod.AgentHandler, f"_handle_remote_provider_{kind}")(handler)
+
+    assert len(observed) == 1
+    assert observed[0]["lifecycleActive"] is True
+    assert observed[0]["activeOperation"] == f"remote_provider_{kind}"
+    assert not _mod._model_lifecycle_status().get("lifecycleActive")
+    acquired, _ = _mod._begin_model_lifecycle("model_recovery")
+    assert acquired, "both successful and failed provider operations release ownership"
+    _mod._end_model_lifecycle("model_recovery")
+    expected_status = (500 if kind == "apply" else 409) if fails else 200
+    assert handler.response_code == expected_status
+
+
 def test_host_selection_serializes_dependency_decisions_with_cli_helper(tmp_path, monkeypatch):
     """The agent uses the installed host selector, including ordered stops."""
     scripts = tmp_path / "scripts"
@@ -402,6 +435,43 @@ def test_core_recreation_excludes_unrelated_secrets_but_keeps_overlays_and_depen
     assert result == [value for value in flags[:6]] + sum(
         (['-f', name] for name in fragments if '/unrelated/' not in name), [])
     assert '${UNRELATED_SECRET:?Required}' in (tmp_path / next(iter(fragments))).read_text()
+
+
+def test_pixel_model_relay_recreation_selects_its_fragment_but_not_the_dashboard_allowlist(tmp_path, monkeypatch):
+    monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+    monkeypatch.setattr(_mod, 'EXTENSIONS_DIR', tmp_path / 'extensions')
+    monkeypatch.setattr(_mod, 'USER_EXTENSIONS_DIR', tmp_path / 'user-extensions')
+    monkeypatch.setattr(_mod, 'CORE_SERVICE_IDS', {'litellm'})
+    fragments = {
+        'extensions/pixel-model-relay/compose.yaml':
+            'services:\n  pixel-model-relay:\n    environment:\n      KEY: ${PIXEL_MODEL_RELAY_KEY:?Required}\n',
+        'extensions/unrelated/compose.yaml':
+            'services:\n  unrelated:\n    environment:\n      SECRET: ${UNRELATED_SECRET:?Required}\n',
+    }
+    flags = ['-f', 'base.yaml']
+    for name, body in fragments.items():
+        file = tmp_path / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(body)
+        flags += ['-f', name]
+    monkeypatch.setattr(_mod, 'resolve_compose_flags', lambda: list(flags))
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, '', '')
+
+    monkeypatch.setattr(_mod.subprocess, 'run', fake_run)
+
+    assert _mod.docker_compose_recreate(['pixel-model-relay']) == (True, '')
+    assert calls == [[
+        'docker', 'compose', '-f', 'base.yaml', '-f', 'extensions/pixel-model-relay/compose.yaml',
+        'up', '-d', '--no-deps', '--force-recreate', 'pixel-model-relay',
+    ]]
+    # Only the agent's own route change recreates it; a dashboard request cannot.
+    ok, error = _mod.validate_core_recreate_ids(['pixel-model-relay'])
+    assert ok is False
+    assert 'not a core ODS service' in error
 
 
 def test_core_recreation_does_not_hide_invalid_extension_yaml(tmp_path, monkeypatch):
@@ -3632,6 +3702,77 @@ class TestPixelOperationsStatus:
         assert handler.response_code == 400
 
 
+def _route_failure_answers(answer, ready="200"):
+    """A fake curl: one completion answer, and LiteLLM's readiness."""
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[-1].endswith("/health/readiness"):
+            return subprocess.CompletedProcess(command, 0, ready, "")
+        code, stdout = answer
+        return subprocess.CompletedProcess(command, code, stdout, "")
+
+    return calls, fake_run
+
+
+def _litellm_error(message, status):
+    return json.dumps({"error": {"message": message, "code": str(status)}}) + f"\n{status}"
+
+
+@pytest.mark.parametrize(("answer", "ready", "expected"), [
+    # The fleet outage: the provider's own 500, passed on by LiteLLM.
+    ((0, _litellm_error("litellm.InternalServerError: InternalServerError: OpenAIException - Connection error.\n"
+                        "Received Model Group=ods/current", 500)), "200",
+     (500, "Connection error.", True)),
+    ((0, _litellm_error("litellm.RateLimitError: RateLimitError: OpenAIException - slow down", 429)), "200",
+     (429, "slow down", True)),
+    ((0, _litellm_error("litellm.ServiceUnavailableError: OpenAIException - overloaded", 503)), "200",
+     (503, "overloaded", True)),
+    # LiteLLM got no HTTP answer from its own egress hop: not the API's fault.
+    ((0, _litellm_error("litellm.APIConnectionError: APIConnectionError: OpenAIException - Connection error.", 500)), "200",
+     (500, "Connection error.", False)),
+    ((0, _litellm_error("litellm.BadRequestError: Invalid model name passed in model=ods/current", 400)), "200",
+     (400, "Invalid model name passed in model=ods/current", False)),
+    ((0, json.dumps({"choices": [{"message": {"content": ""}}]}) + "\n200"), "200",
+     (200, "The API answered with an empty completion", True)),
+    ((28, ""), "200", (504, "The API did not answer within 30 seconds", True)),
+    ((28, ""), "000", (None, "LiteLLM did not answer in time", False)),
+    ((7, "\n000"), "200", (None, "LiteLLM did not answer", False)),
+    ((0, json.dumps({"choices": [{"message": {"content": "READY"}}]}) + "\n200"), "200", None),
+])
+def test_litellm_route_failure_tells_the_providers_answer_from_litellms_own(monkeypatch, answer, ready, expected):
+    calls, fake_run = _route_failure_answers(answer, ready)
+    monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+    env = {"LITELLM_KEY": "unit-test-litellm-key", "LITELLM_PORT": "4000"}
+
+    assert _mod._litellm_route_failure(env) == expected
+
+    command, kwargs = calls[0]
+    assert "unit-test-litellm-key" not in " ".join(command)
+    assert kwargs["input"] == "Authorization: Bearer unit-test-litellm-key\n"
+    assert kwargs["encoding"] == "utf-8" and kwargs["errors"] == "replace"
+    assert command[command.index("-X") + 2] == "http://127.0.0.1:4000/v1/chat/completions"
+
+
+def test_litellm_route_failure_never_passes_on_a_key_echo_or_a_backslash(monkeypatch):
+    # Key- and hash-shaped values are built at runtime so secret scanners stay quiet.
+    key_hash = hashlib.sha256(b"unit-test").hexdigest()
+    fake_key = "sk-" + "unittest" + "fake01"
+    message = ("litellm.InternalServerError: OpenAIException - Connection error. "
+               f"Received API Key = sk-...wxyz, Key Hash (Token) ={key_hash}, "
+               f"Rate limit exceeded for api_key: {key_hash[:40]} {fake_key} \\e[31mred\\c")
+    _calls, fake_run = _route_failure_answers((0, _litellm_error(message, 500)))
+    monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+    status, text, provider = _mod._litellm_route_failure({"LITELLM_KEY": "k"})
+
+    assert (status, provider) == (500, True)
+    assert key_hash not in text and key_hash[:32] not in text and fake_key not in text
+    assert "\\" not in text
+    assert text.startswith("Connection error. Received API Key = [redacted], Key Hash (Token) =[redacted]")
+
+
 class TestRemoteProviderLifecycle:
     """Direct host-agent tests for remote-provider lifecycle planning/apply."""
 
@@ -4081,6 +4222,110 @@ class TestRemoteProviderLifecycle:
         assert "unit-test-provider-token" not in dumped
         assert "unit-test-ssh-key" not in dumped
         assert '"raw"' not in dumped
+
+    def _active_route_with_matching_consumers(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        root = tmp_path / "remote-provider"
+        root.mkdir(parents=True)
+        plan = _mod._plan_remote_provider_lifecycle_operation(self._ssh_configure_payload())
+        state = _mod._remote_provider_route_state_from_plan(plan)
+        (root / "routing-state.json").write_text(json.dumps(state), encoding="utf-8")
+        runtime = _mod._remote_provider_runtime_contract(state)
+        monkeypatch.setattr(_mod, "_read_remote_provider_activation_state", lambda: {
+            "phase": "active", "remote": runtime,
+            "routeFingerprint": _mod._remote_provider_route_fingerprint(state),
+        })
+        (tmp_path / ".env").write_text("ODS_MODE=cloud\nLLM_API_URL=http://litellm:4000\n", encoding="utf-8")
+        monkeypatch.setattr(_mod, "_managed_pixel_runtime_contract", lambda: runtime)
+        return root / "routing-state.json"
+
+    def test_provider_outage_on_an_active_route_is_reported_without_reactivation(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """Fleet 2026-10-18: during an outage a test recreated LiteLLM twice,
+        could hold Portal's model lane, and reported nothing useful."""
+        state_path = self._active_route_with_matching_consumers(monkeypatch, tmp_path)
+        asked = []
+
+        def outage(env, *, model="ods/current"):
+            asked.append(model)
+            return 500, "Connection error.", True
+
+        monkeypatch.setattr(_mod, "_litellm_route_failure", outage)
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+
+        def no_activation(route):
+            raise AssertionError("a provider outage must not re-activate the route")
+
+        monkeypatch.setattr(_mod, "_activate_remote_provider_route", no_activation)
+        before = state_path.read_bytes()
+        handler = _FakeHandler(json.dumps(self._egress_probe_response()).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_proof(handler)
+
+        assert handler.response_code == 502
+        assert handler.parse_response() == {
+            "error": "The remote provider did not serve a completion through the active route",
+            "code": "provider_not_serving",
+            "providerStatus": 500,
+            "providerMessage": "Connection error.",
+        }
+        assert state_path.read_bytes() == before
+        assert len(asked) == 2, "a single failure is asked once more"
+
+    def test_a_single_provider_hiccup_is_not_reported_as_an_outage(self, monkeypatch, tmp_path):
+        self._active_route_with_matching_consumers(monkeypatch, tmp_path)
+        answers = [(429, "slow down", True), None]
+        monkeypatch.setattr(_mod, "_litellm_route_failure", lambda env, *, model="ods/current": answers.pop(0))
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(_mod, "_activate_remote_provider_route",
+                            lambda route: pytest.fail("a working route must not be re-activated"))
+        handler = _FakeHandler(json.dumps(self._egress_probe_response()).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_proof(handler)
+
+        assert handler.response_code == 200
+        assert handler.parse_response()["activation"]["proven"] is True
+
+    @pytest.mark.parametrize("failure", [
+        (None, "LiteLLM did not answer", False),
+        (400, "Invalid model name", False),
+        (500, "Connection error.", False),
+    ])
+    @pytest.mark.parametrize("answers_later", [False, True])
+    def test_litellm_faults_on_an_active_route_keep_the_earlier_paths(
+        self,
+        monkeypatch,
+        tmp_path,
+        failure,
+        answers_later,
+    ):
+        """LiteLLM's own fault, or a LiteLLM still starting, gets the earlier
+        wait for a completion and then the repair path (a fresh activation)."""
+        self._active_route_with_matching_consumers(monkeypatch, tmp_path)
+        monkeypatch.setattr(_mod, "_litellm_route_failure", lambda env, *, model="ods/current": failure)
+
+        def earlier_wait(env, *, model="default"):
+            if not answers_later:
+                raise RuntimeError("LiteLLM did not serve a completion through the active ods/current route")
+
+        monkeypatch.setattr(_mod, "_verify_litellm_route", earlier_wait)
+        activated = []
+
+        def activate(route):
+            activated.append(route)
+            return {"active": True, "proven": True}
+
+        monkeypatch.setattr(_mod, "_activate_remote_provider_route", activate)
+        handler = _FakeHandler(json.dumps(self._egress_probe_response()).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_proof(handler)
+
+        assert handler.response_code == 200
+        assert len(activated) == (0 if answers_later else 1)
 
     def test_rejects_failed_egress_probe_without_overwriting_route_proof(
         self,
@@ -4877,7 +5122,8 @@ class TestRemoteProviderLifecycle:
         remote_pixel = {
             "model": "qwen/remote:latest",
             "contextLength": 32768,
-            "maxTokens": 4096,
+            # The default output limit: a quarter of the context window.
+            "maxTokens": 8192,
             "reasoning": False,
             "imageInput": "unknown",
         }
@@ -4971,6 +5217,7 @@ class TestRemoteProviderLifecycle:
             ("public", True),
         ]
 
+        monkeypatch.setattr(_mod, "_litellm_route_failure", lambda env, *, model="ods/current": None)
         current = _mod._verify_current_remote_provider_consumers(plan["route"], remote_pixel)
         assert current["unchanged"] is True
         assert current["pixel"] == "reconciled"
@@ -5083,6 +5330,144 @@ class TestRemoteProviderLifecycle:
         assert cloud_path.read_text(encoding="utf-8") == original_cloud
         assert not (data_dir / "remote-provider" / "activation-state.json").exists()
         assert not (data_dir / "remote-provider" / "activation-public.json").exists()
+
+    def test_route_changes_recreate_pixel_model_relay_for_the_new_mode(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """relay.py picks model-router or LiteLLM from ODS_MODE once, at start.
+
+        Fleet 2026-10-18 (F17): after `ods remote-provider configure` the kept
+        relay still sent Portal to the local model until it was recreated.
+        """
+        install_dir = tmp_path / "ods"
+        data_dir = install_dir / "data"
+        cloud_path = install_dir / "config" / "litellm" / "cloud.yaml"
+        cloud_path.parent.mkdir(parents=True)
+        data_dir.mkdir(parents=True)
+        env_path = install_dir / ".env"
+        env_path.write_text("ODS_MODE=local\nLLM_API_URL=http://llama-server:8080\n", encoding="utf-8")
+        cloud_path.write_text("previous-cloud\n", encoding="utf-8")
+        env_path.chmod(0o600)
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "DATA_DIR", data_dir)
+        local_pixel = {"model": "qwen-local", "contextLength": 65536, "maxTokens": 4096, "reasoning": False}
+        current_pixel = {"value": local_pixel}
+        events = []
+
+        def mode():
+            return _mod.load_env(env_path)["ODS_MODE"]
+
+        def restart(container, state, *, recreate=False):
+            assert state == {"exists": True, "running": True}
+            events.append(("recreate" if recreate else "restart", container, mode()))
+            return True
+
+        def restore(container, previous, *, recreate=False):
+            assert previous == {"exists": True, "running": True} and recreate is True
+            events.append(("restore", container, mode()))
+            return True
+
+        def reconcile(contract, **_kwargs):
+            events.append(("pixel", contract["model"], mode()))
+            current_pixel["value"] = contract
+            return "reconciled"
+
+        monkeypatch.setattr(
+            _mod, "_capture_container_state", lambda _name: {"exists": True, "running": True},
+        )
+        monkeypatch.setattr(_mod, "_restart_existing_container", restart)
+        monkeypatch.setattr(_mod, "_restore_container_state", restore)
+        monkeypatch.setattr(_mod, "_wait_for_container_health", lambda _name: None)
+        monkeypatch.setattr(_mod, "_verify_litellm_route", lambda env, *, model="default": None)
+        monkeypatch.setattr(
+            _mod,
+            "_render_remote_provider_cloud_config",
+            lambda route, env: cloud_path.write_text("remote-cloud\n", encoding="utf-8"),
+        )
+        monkeypatch.setattr(_mod, "_managed_pixel_runtime_contract", lambda: current_pixel["value"])
+        monkeypatch.setattr(_mod, "_managed_pixel_thinking_control", lambda: None)
+        monkeypatch.setattr(_mod, "_reconcile_managed_pixel_contract", reconcile)
+        route = _mod._plan_remote_provider_lifecycle_operation(self._configure_payload())["route"]
+
+        _mod._activate_remote_provider_route(route)
+
+        assert events == [
+            ("recreate", "ods-litellm", "cloud"),
+            ("recreate", "ods-pixel-model-relay", "cloud"),
+            ("pixel", "qwen/remote:latest", "cloud"),
+        ]
+        events.clear()
+
+        _mod._deactivate_remote_provider_route()
+
+        assert events == [
+            ("recreate", "ods-litellm", "local"),
+            ("recreate", "ods-pixel-model-relay", "local"),
+            ("pixel", "qwen-local", "local"),
+        ]
+        events.clear()
+
+        # A failed activation puts the relay back on the restored local route.
+        def fail_remote(contract, **kwargs):
+            reconcile(contract, **kwargs)
+            if contract["model"] != "qwen-local":
+                raise RuntimeError("simulated Pixel binding failure")
+            return "reconciled"
+
+        monkeypatch.setattr(_mod, "_reconcile_managed_pixel_contract", fail_remote)
+        with pytest.raises(RuntimeError, match="simulated Pixel binding failure"):
+            _mod._activate_remote_provider_route(route)
+
+        assert mode() == "local"
+        assert events == [
+            ("recreate", "ods-litellm", "cloud"),
+            ("recreate", "ods-pixel-model-relay", "cloud"),
+            ("pixel", "qwen/remote:latest", "cloud"),
+            ("recreate", "ods-pixel-model-relay", "local"),
+            ("restore", "ods-litellm", "local"),
+            ("pixel", "qwen-local", "local"),
+        ]
+
+        # Disable is the fail-safe path: a relay that cannot follow does not
+        # keep the owner on the remote route.
+        monkeypatch.setattr(_mod, "_reconcile_managed_pixel_contract", reconcile)
+        _mod._activate_remote_provider_route(route)
+
+        def relay_fault(container, state, *, recreate=False):
+            if container == "ods-pixel-model-relay":
+                raise RuntimeError("simulated relay fault")
+            return restart(container, state, recreate=recreate)
+
+        monkeypatch.setattr(_mod, "_restart_existing_container", relay_fault)
+        assert _mod._deactivate_remote_provider_route()["restored"] is True
+        assert mode() == "local"
+
+
+def test_compose_recreation_reads_the_route_from_env_not_the_agents_environment(tmp_path, monkeypatch):
+    """An agent started from a shell carries .env as it was at start."""
+    monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+    monkeypatch.setattr(_mod, 'EXTENSIONS_DIR', tmp_path / 'extensions')
+    monkeypatch.setattr(_mod, 'USER_EXTENSIONS_DIR', tmp_path / 'user-extensions')
+    monkeypatch.setattr(_mod, 'CORE_SERVICE_IDS', {'litellm'})
+    monkeypatch.setattr(_mod, 'resolve_compose_flags', lambda: ['-f', 'base.yaml'])
+    for key, value in (("ODS_MODE", "local"), ("LLM_API_URL", "http://llama-server:8080"),
+                       ("EXTERNAL_LLM_URL", "http://host.docker.internal:8080")):
+        monkeypatch.setenv(key, value)
+    seen = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(kwargs['env'])
+        return subprocess.CompletedProcess(cmd, 0, '', '')
+
+    monkeypatch.setattr(_mod.subprocess, 'run', fake_run)
+
+    assert _mod.docker_compose_recreate(['litellm']) == (True, '')
+    assert _mod.docker_compose_converge(['pixel-model-relay']) == (True, '')
+
+    for env in seen:
+        assert {'ODS_MODE', 'LLM_API_URL', 'EXTERNAL_LLM_URL'}.isdisjoint(env)
 
 
 class TestTailscaleStatus:

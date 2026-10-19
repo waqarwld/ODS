@@ -36,6 +36,7 @@ import { assistantMessageText, composeProgressFinalization, composeReadPages, cr
   PROGRESS_FINALIZATION_INSTRUCTION } from "./progress-finalization.mjs";
 import { STOP_SYNTHESIS_LIMITS, STOP_SYNTHESIS_NOTE, synthesisAnswer, synthesisRequest } from "./stop-synthesis.mjs";
 import { createRunDeadline, runDeadlineReached, runDeadlineStopText, takeRunDeadlineNotice } from "./run-deadline.mjs";
+import { outputLimitContext, outputLimitCut, outputLimitNotice, outputLimitStopText } from "./output-limit.mjs";
 import { OWNER_VISIBLE_REPLY_INSTRUCTION, OWNER_VISIBLE_REPLY_REASON, ownerInteractiveTurn, silentReplyText } from "./owner-visible-reply.mjs";
 import { canonicalWorkspaceParams, extensionlessHtmlWrite, workspaceFileParent, nativeExecWorkdir, sandboxHostWorkspaceFailure, malformedRelativeWorkspacePath } from "./workspace-path-contract.mjs";
 import { routePlaygroundTool, requestsNewPlaygroundProject } from "./playground-projects.mjs";
@@ -422,6 +423,33 @@ export const OPERATIONS_REQUIRES_PROJECTIONS_REASON =
 
 export const OPERATIONS_LOOP_ABORT_REASON =
   "Pixel stopped this response because it requested another non-Operations tool after the host Operations boundary was enforced. Start a fresh message to retry the named broker action.";
+
+// Owner copy for that stop. The harness ends the aborted run with its own
+// error, which read "LLM request timed out." (fleet 2026-10-18, laptop).
+// A tool name is model-written; only a plain identifier is shown.
+function operationsLoopCause({tool, boundary}) {
+  const name = typeof tool === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(tool) ? `\`${tool}\`` : "another tool";
+  return boundary === "continuation"
+    ? `this response was waiting for the result of an ODS Operations job, and the model called ${name} instead of reading it`
+    : `this request needed ODS Operations work on this computer, and the model kept calling ${name}, which that step does not allow`;
+}
+
+// A combined request would meet the same boundary again, so the retry advice
+// asks for other work in a message of its own.
+export function operationsLoopDeliveryText(abort) {
+  return `**Portal stopped this response:** ${operationsLoopCause(abort)}, so Portal ended the response rather than let it loop. ` +
+    "That call did not run. The conversation and any saved files are preserved. Send a new message to try again, " +
+    "and ask for a file or other work in a message of its own. " +
+    "If it keeps happening, [get help on Discord](https://discord.gg/4ntNp9MAwC).";
+}
+
+// The same stop when Portal had already verified a result, which follows.
+export function operationsLoopVerifiedText(abort) {
+  return `**Portal stopped this response after verifying the result below:** ${operationsLoopCause(abort)}, ` +
+    "so Portal ended the response rather than let it loop. That call did not run. " +
+    "If you need more, such as a file, ask for it in a new message. " +
+    "If it keeps happening, [get help on Discord](https://discord.gg/4ntNp9MAwC).";
+}
 
 export const OPERATIONS_UNAVAILABLE_DELIVERY_PREFIX =
   "Portal did not submit the requested host or Operations work through the isolated Operations Broker. No sandbox command was accepted as host evidence.";
@@ -7255,6 +7283,9 @@ export function createToolLoopGuard({
   // (subagent-delivery.mjs ownerRunOf), for the shipped example's guard.
   exampleOwnerRun = () => undefined,
   exampleGuard,
+  // Whether Pixel's model is the owner's remote API route, whose output limit
+  // the owner sets (Settings → Remote model), for output-limit stop text.
+  remoteModelRoute = () => false,
 } = {}) {
   const effective = normalizedLimits(limits);
   const examples = exampleGuard ?? createExampleGuard({warn, now});
@@ -7278,6 +7309,9 @@ export function createToolLoopGuard({
   // next owner message in that chat must start clean from.
   const sessionKeyRuns = new Map();
   const sessionCancellations = new Map();
+  // A tool call the model's output limit cut off, which the chat's next turn
+  // is told to write in smaller parts (output-limit.mjs).
+  const sessionOutputLimits = new Map();
   // Process-wide: a failed or timed-out stop synthesis pauses further ones.
   let stopSynthesisFailedAt = -Infinity;
   const pendingToolRuns = new Map();
@@ -7491,6 +7525,16 @@ export function createToolLoopGuard({
     sessionCancellations.delete(sessionKey);
     state.withdrawnOwnerRequest = record;
     state.completionAssurance.followWithdrawnRequest(record.ownerText);
+  }
+
+  // The next owner turn in a chat whose last response ended on a cut-off tool
+  // call takes that cut once; every attempt of that run is told about it.
+  function takeOutputLimit(state, runId, context, agentId) {
+    const sessionKey = context?.sessionKey;
+    const record = typeof sessionKey === "string" ? sessionOutputLimits.get(sessionKey) : undefined;
+    if (!record || record.runId === runId || !ownerInteractiveTurn(context, agentId)) return;
+    sessionOutputLimits.delete(sessionKey);
+    state.priorOutputLimit = record.cut;
   }
 
   // A clarification card leaves a record for its chat once the run sets it
@@ -7777,6 +7821,8 @@ export function createToolLoopGuard({
         unrequestedOperationsDeniedRound: 0,
         unrequestedOperationsTerminal: false,
         unrequestedOperationsAborted: false,
+        // The tool whose repeat after an Operations correction aborted the run.
+        operationsLoopAborted: undefined,
         operationsInventoryOnly: false,
         operationsInventoryAttempted: false,
         operationsInventory: undefined,
@@ -9279,6 +9325,7 @@ export function createToolLoopGuard({
       warn(
         `Pixel stopped a tool retry after the Operations-continuation boundary for run ${runId}; active run aborted=${aborted}`
       );
+      if (aborted) state.operationsLoopAborted ??= {tool: effectiveToolName, boundary: "continuation"};
       return { block: true, blockReason: OPERATIONS_LOOP_ABORT_REASON };
     }
 
@@ -9339,6 +9386,7 @@ export function createToolLoopGuard({
       warn(
         `Pixel stopped a tool retry after the Operations boundary for run ${runId}; active run aborted=${aborted}`
       );
+      if (aborted) state.operationsLoopAborted ??= {tool: effectiveToolName, boundary: "operations"};
       return { block: true, blockReason: OPERATIONS_LOOP_ABORT_REASON };
     }
 
@@ -10101,6 +10149,9 @@ export function createToolLoopGuard({
         state.runDeadline = state.artifactOwnerInteractive && !state.managedTeamWorker
           ? createRunDeadline(capabilities.runTimeoutSeconds, now(), state.runDeadline) : undefined;
         state.runDeadlineReached = false;
+        // Like the deadline, a cut belongs to the attempt that wrote it.
+        state.lastReplyCut = undefined;
+        state.outputLimitStop = undefined;
       }
       if (typeof sessionId === "string" && sessionId) {
         state.currentSessionId = sessionId;
@@ -10117,6 +10168,7 @@ export function createToolLoopGuard({
       if (ownerIntent) state.ownerRequestText ??= ownerIntent;
       if (ownerWords) state.managedOwnerWords ??= ownerWords;
       takeOwnerCancellation(state, runId, context, agentId);
+      takeOutputLimit(state, runId, context, agentId);
       takePendingClarification(state, runId, context, agentId, ownerIntent);
       if (currentUserText(event?.messages, event?.prompt)) {
         state.ownerIntentObserved = true;
@@ -10470,7 +10522,11 @@ export function createToolLoopGuard({
     if (!state || !context?.sessionId || context.sessionId !== state.currentSessionId) return;
     const compaction = state.compactionWindow;
     if (compaction?.calls.delete(event?.callId) && compaction.calls.size === 0) state.compactionWindow = undefined;
-    if (event?.outcome === 'completed') state.modelRouteFailed = false;
+    if (event?.outcome === 'completed') {
+      state.modelRouteFailed = false;
+      // A later model call completed, so that abort did not end this run.
+      state.operationsLoopAborted = undefined;
+    }
     else if (event?.outcome === 'error' && !state.progressAbortAttempted && !state.webLoopAborted &&
         ['timeout', 'connection_closed', 'connection_reset', 'terminated'].includes(event.failureKind)) state.modelRouteFailed = true;
     if (state.extensionPendingHandoff && !state.workspaceLaneRequested && !state.extensionPendingAbortAcknowledged &&
@@ -12870,7 +12926,30 @@ export function createToolLoopGuard({
     state.runEnded = true;
     state.runDeadlineReached = !state.clientCancelled && !state.odsAborted && !state.progressBudget.exhausted &&
       !state.recursiveDeleteDenied && runDeadlineReached(state.runDeadline, event, now());
+    // The harness runs tool calls only after a 'toolUse' stop, so a reply cut
+    // at the output limit ends the response with its last call never run.
+    // Only the owner's own turns: team workers and other lanes report to a
+    // coordinator or parent, not to the owner.
+    state.outputLimitStop = !state.clientCancelled && !state.odsAborted && event?.success !== false &&
+      state.artifactOwnerInteractive && !state.managedTeamWorker ? state.lastReplyCut : undefined;
+    const sessionKey = state.currentSessionKey;
+    if (state.outputLimitStop?.tool && typeof sessionKey === "string") {
+      rememberBySessionKey(sessionOutputLimits, sessionKey, {runId, cut: state.outputLimitStop});
+    } else if (typeof sessionKey === "string" && sessionOutputLimits.get(sessionKey)?.runId === runId) {
+      sessionOutputLimits.delete(sessionKey);
+    }
     settlePendingClarification(state, event);
+  }
+
+  // before_message_write, in transcript order: the last reply this run wrote
+  // decides whether its response ended at the output limit. agent_end's
+  // message list is the whole session history, not this attempt.
+  function observeReplyEnd(event, context, agentId = 'pixel') {
+    const agent = context?.agentId ?? event?.agentId;
+    if (agent !== undefined && agent !== agentId) return;
+    if (event?.message?.role !== 'assistant') return;
+    const active = activeSessionRun(context?.sessionKey ?? event?.sessionKey);
+    if (active) active.state.lastReplyCut = outputLimitCut(event.message);
   }
 
   // Model-only prompt context for one attempt (before_prompt_build
@@ -12880,7 +12959,9 @@ export function createToolLoopGuard({
   function promptContextForRun(runId) {
     const state = typeof runId === "string" ? runs.get(runId) : undefined;
     if (state?.clientCancelled) return CLIENT_CANCELLED_REASON;
-    return state?.withdrawnOwnerRequest && !resendsWithdrawnAnswer(state) ? OWNER_CANCELLED_REQUEST_CONTEXT : undefined;
+    const withdrawn = state?.withdrawnOwnerRequest && !resendsWithdrawnAnswer(state) ? OWNER_CANCELLED_REQUEST_CONTEXT : undefined;
+    const outputLimit = state?.priorOutputLimit ? outputLimitContext(state.priorOutputLimit) : undefined;
+    return [withdrawn, outputLimit].filter(Boolean).join('\n\n') || undefined;
   }
 
   // The owner stopped a clarification answer and sent the same answer again.
@@ -13446,7 +13527,12 @@ export function createToolLoopGuard({
     // The shipped example's one owner line, which Portal's ingress adds after
     // the reply it delivers (host/pixel_ingress.mjs). A pending question card
     // carries none.
-    const notice = result.status === 'pending' ? undefined : exampleNoticeForRun(runId);
+    // A cut-off text answer is delivered as written, with its notice first.
+    // The ingress takes one line of at most 1024 characters.
+    const cut = state?.outputLimitStop?.answered && !state.clientCancelled && !state.progressBudget.exhausted
+      ? outputLimitNotice(state.outputLimitStop, {remote: remoteModelRoute() === true}) : undefined;
+    const notice = result.status === 'pending' ? undefined
+      : [cut, exampleNoticeForRun(runId)].filter(Boolean).join(' ').slice(0, 1024);
     if (notice) result = {...result, notice};
     return artifacts?.length && !state.clientCancelled && ['none','passed','failed'].includes(result.status)
       ? {...result,artifacts:structuredClone(artifacts)} : result;
@@ -13470,6 +13556,21 @@ export function createToolLoopGuard({
         preview && `[Open last published preview](${preview.url})\n\nThis is the last verified publication, not proof that all requested work completed.`,
         failure?.text].filter(Boolean).join('\n\n').slice(0, MAX_INGRESS_VERIFICATION_TEXT),
       ...(failure?.preview ? {preview: failure.preview}
+        : preview ? {preview: {schemaVersion: 1, kind: 'ods-pixel-workspace-preview', ...preview}} : {})};
+    }
+    // Without this the owner saw only a missing preview or "No detailed
+    // failure reason was returned". Verified facts and the last published
+    // preview follow, as after the run deadline. A cut-off text answer keeps
+    // its text and gets a notice instead (deliveryVerificationForRun).
+    const outputLimit = !state?.clientCancelled && !state?.progressBudget.exhausted ? state?.outputLimitStop : undefined;
+    if (outputLimit && !outputLimit.answered) {
+      const prior = (verification.status === 'failed' || verification.status === 'passed') && verification.text
+        ? verification : undefined;
+      const preview = prior?.preview ? undefined : progressStopPreview(state);
+      return {status: 'failed', text: [outputLimitStopText(outputLimit, {remote: remoteModelRoute() === true}),
+        preview && `[Open last published preview](${preview.url})\n\nThis is the last verified publication, not proof that all requested work completed.`,
+        prior?.text].filter(Boolean).join('\n\n').slice(0, MAX_INGRESS_VERIFICATION_TEXT),
+      ...(prior?.preview ? {preview: prior.preview}
         : preview ? {preview: {schemaVersion: 1, kind: 'ods-pixel-workspace-preview', ...preview}} : {})};
     }
     // Completion assurance arms its terminal before a revision and is not
@@ -13523,10 +13624,23 @@ export function createToolLoopGuard({
         (state.operationsRequiredActions.size > 0 &&
           [...state.operationsRequiredActions].every((action) =>
             action.startsWith("host.") || action === "ods.extensions.list" || action === "ods.extensions.search"))));
-    return verification.status === "passed" && verification.text &&
+    const result = verification.status === "passed" && verification.text &&
       (readOnlyOperations || verification.preview || state?.exactDownloadPromotion)
       ? derivedOutcome(verification, { ...verification, deliveryMode: "append" })
       : verification;
+    // After an Operations-boundary abort the harness error ("LLM request
+    // timed out.") is the reply: alone, or above appended evidence. Name the
+    // cause there. A receipt or failure text that replaces it stays as it is.
+    const abort = state?.clientCancelled ? undefined : state?.operationsLoopAborted;
+    if (abort && result.status === "none") {
+      return { status: "failed", text: operationsLoopDeliveryText(abort) };
+    }
+    if (abort && result.deliveryMode === "append") {
+      const verified = { ...result, text: `${operationsLoopVerifiedText(abort)}\n\n${result.text}`.slice(0, MAX_INGRESS_VERIFICATION_TEXT) };
+      delete verified.deliveryMode;
+      return verified;
+    }
+    return result;
   }
 
   function replyPayloadSending(event) {
@@ -13629,6 +13743,7 @@ export function createToolLoopGuard({
     citationVerificationForRun: runId => [...(runs.get(runId)?.hostCitationVerifications ?? [])],
     endPreviewRevalidation,
     observeAgentEnd,
+    observeReplyEnd,
     promptContextForRun,
     clarificationContextForRun,
     replyPayloadSending,

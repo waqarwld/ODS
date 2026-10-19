@@ -287,6 +287,10 @@ _ALLOWED_CORE_RECREATE_IDS = frozenset({
     "tts", "whisper", "embeddings", "token-spy", "comfyui",
     "ape", "privacy-shield", "model-router",
 })
+# Pixel's model relay picks its upstream (model-router, or LiteLLM in cloud
+# mode) from ODS_MODE once, when it starts. A remote-provider route change
+# therefore recreates it with LiteLLM, or Portal keeps the old model.
+_PIXEL_MODEL_RELAY_CONTAINER = "ods-pixel-model-relay"
 
 
 def _to_bash_path(path: Path) -> str:
@@ -3883,6 +3887,15 @@ class _RemoteProviderApplyError(RuntimeError):
         self.rollback = rollback
 
 
+class _RemoteProviderNotServing(RuntimeError):
+    """The active route's consumers match, but the provider serves no completion."""
+
+    def __init__(self, provider_status: int, provider_message: str) -> None:
+        super().__init__("The remote provider did not serve a completion through the active route")
+        self.provider_status = provider_status
+        self.provider_message = provider_message
+
+
 def _remote_provider_root() -> Path:
     return DATA_DIR / "remote-provider"
 
@@ -4448,6 +4461,7 @@ def _valid_managed_pixel_runtime_contract(value: object) -> bool:
         and 1 <= max_tokens <= context_length
         and type(reasoning) is bool
         and ("imageInput" not in value or value["imageInput"] in ("supported", "unsupported", "unknown"))
+        and ("thinkingControl" not in value or value["thinkingControl"] in ("enable_thinking", "always", "none"))
         and ("routeFingerprint" not in value or (
             isinstance(value["routeFingerprint"], str)
             and re.fullmatch(r"[a-f0-9]{64}", value["routeFingerprint"]) is not None
@@ -5319,10 +5333,23 @@ def _verify_current_remote_provider_consumers(
     pixel = _managed_pixel_runtime_contract()
     if pixel is not None and pixel != runtime:
         return None
-    try:
-        _verify_litellm_route(env, model="ods/current")
-    except RuntimeError:
-        return None
+    failure = _litellm_route_failure(env)
+    if failure is not None and failure[2]:
+        # LiteLLM and its egress hop work, but the provider fails chats. A new
+        # activation would recreate LiteLLM and hold Portal's model lane through
+        # an outage it cannot fix (fleet 2026-10-18: a test took ~80 s and said
+        # nothing). A single 429 or 503 is not an outage, so ask once more.
+        time.sleep(2)
+        failure = _litellm_route_failure(env)
+        if failure is not None and failure[2] and failure[0] is not None:
+            raise _RemoteProviderNotServing(failure[0], failure[1])
+    if failure is not None:
+        # LiteLLM's own fault, or a LiteLLM that is still starting: give it the
+        # earlier time to answer, then let the repair path recreate it.
+        try:
+            _verify_litellm_route(env, model="ods/current")
+        except RuntimeError:
+            return None
     activation = {
         "active": True,
         "gateway": "litellm-cloud",
@@ -5361,6 +5388,27 @@ def _render_remote_provider_cloud_config(route: dict, env: dict[str, str]) -> No
         raise RuntimeError("Could not render the remote-provider LiteLLM route")
 
 
+def _refresh_pixel_model_relay(state: dict[str, bool]) -> None:
+    """Recreate a relay that was running so it takes the route .env now names."""
+    if _restart_existing_container(_PIXEL_MODEL_RELAY_CONTAINER, state, recreate=True):
+        _wait_for_container_health(_PIXEL_MODEL_RELAY_CONTAINER)
+
+
+def _restore_pixel_model_relay(state: dict[str, bool]) -> None:
+    """Best effort, for rollbacks and disable, the fail-safe path.
+
+    A relay left on LiteLLM still reaches a restored local route through it;
+    the warning names the repair for one left on the local route.
+    """
+    try:
+        _refresh_pixel_model_relay(state)
+    except RuntimeError as exc:
+        logger.warning(
+            "Pixel model relay did not follow the restored model route (%s); "
+            "repair it with: ods restart pixel-model-relay", exc,
+        )
+
+
 def _activate_remote_provider_route(
     route: dict, *, transaction=None, defer_consumer_rollback: bool = False,
 ) -> dict[str, object]:
@@ -5382,6 +5430,7 @@ def _activate_remote_provider_route(
     container_state = _capture_container_state("ods-litellm")
     if not container_state.get("running"):
         raise RuntimeError("LiteLLM must be running before a remote provider can become active")
+    relay_state = _capture_container_state(_PIXEL_MODEL_RELAY_CONTAINER)
 
     existing = _read_remote_provider_activation_state()
     previous = existing.get("previous") if isinstance(existing, dict) else None
@@ -5412,6 +5461,7 @@ def _activate_remote_provider_route(
     pixel_attempted = False
     litellm_recreated = False
     litellm_attempted = False
+    relay_attempted = False
     try:
         _write_remote_provider_activation_state(candidate_state)
         raw_env = str(env_snapshot.get("text") or "")
@@ -5428,6 +5478,10 @@ def _activate_remote_provider_route(
             raise RuntimeError("LiteLLM route could not be recreated")
         _wait_for_container_health("ods-litellm")
         _verify_litellm_route(env, model="ods/current")
+        # Portal reaches the model through the relay, so it must follow
+        # ODS_MODE to LiteLLM before Pixel is bound to the remote model.
+        relay_attempted = True
+        _refresh_pixel_model_relay(relay_state)
         pixel_attempted = pixel_before is not None
         pixel_status = transaction.apply(runtime) if transaction is not None else _reconcile_managed_pixel_contract(runtime)
         activation_public = {
@@ -5466,6 +5520,10 @@ def _activate_remote_provider_route(
             _restore_text_file(activation_public_path, activation_public_snapshot)
         except Exception as rollback_exc:
             rollback_errors.append(f"configuration: {rollback_exc}")
+        # The relay reads only .env, restored above, so it is restored here
+        # even when the lifecycle owner refreshes LiteLLM itself.
+        if relay_attempted:
+            _restore_pixel_model_relay(relay_state)
         # The lifecycle owner must restore its route and credential snapshots
         # before refreshing a consumer that reads those files at startup.
         if litellm_attempted and not defer_consumer_rollback:
@@ -5507,6 +5565,7 @@ def _deactivate_remote_provider_route(*, transaction=None) -> dict[str, object]:
     activation_public_snapshot = _snapshot_text_file(activation_public_path)
     pixel_before = transaction.previous if transaction is not None else _managed_pixel_runtime_contract()
     container_state = _capture_container_state("ods-litellm")
+    relay_state = _capture_container_state(_PIXEL_MODEL_RELAY_CONTAINER)
     owns_transaction = transaction is None
     if owns_transaction:
         transaction = _begin_pixel_model_transaction(load_env(env_path))
@@ -5514,6 +5573,7 @@ def _deactivate_remote_provider_route(*, transaction=None) -> dict[str, object]:
             pixel_before = transaction.previous
     litellm_recreated = False
     litellm_attempted = False
+    relay_attempted = False
     pixel_attempted = False
     try:
         raw_env = str(env_snapshot.get("text") or "")
@@ -5533,6 +5593,10 @@ def _deactivate_remote_provider_route(*, transaction=None) -> dict[str, object]:
         _wait_for_container_health("ods-litellm")
         restored_env = load_env(env_path)
         _verify_litellm_route(restored_env, model="ods/current")
+        # Send Portal's relay back to the restored mode's route as well. Best
+        # effort: disable is the fail-safe path and must not fail on the relay.
+        relay_attempted = True
+        _restore_pixel_model_relay(relay_state)
         previous_pixel = previous.get("pixel")
         pixel_attempted = previous_pixel is not None
         if transaction is not None:
@@ -5570,6 +5634,8 @@ def _deactivate_remote_provider_route(*, transaction=None) -> dict[str, object]:
             _restore_text_file(activation_public_path, activation_public_snapshot)
         except Exception as rollback_exc:
             rollback_errors.append(f"configuration: {rollback_exc}")
+        if relay_attempted:
+            _restore_pixel_model_relay(relay_state)
         if litellm_attempted:
             try:
                 _restore_container_state("ods-litellm", container_state, recreate=True)
@@ -7332,19 +7398,20 @@ def validate_core_recreate_ids(service_ids: list[str]) -> tuple[bool, str]:
     return True, ""
 
 
-def _core_recreate_compose_flags(flags: list[str]) -> list[str]:
+def _core_recreate_compose_flags(flags: list[str], services: tuple[str, ...] | list[str] = ()) -> list[str]:
     """Exclude unrelated extension fragments before Compose interpolates them.
 
     Preserve core overlays and whole extension fragment groups that contribute
-    to core services, including their service references. Missing configuration
-    in a selected fragment must still fail; never fill it with dummy secrets.
+    to core services or to the requested ``services``, including their service
+    references. Missing configuration in a selected fragment must still fail;
+    never fill it with dummy secrets.
     """
     import yaml
 
     roots = (EXTENSIONS_DIR.resolve(), USER_EXTENSIONS_DIR.resolve())
     groups = {}
     file_groups = {}
-    needed = set(CORE_SERVICE_IDS)
+    needed = set(CORE_SERVICE_IDS) | set(services)
     for index, flag in enumerate(flags[:-1]):
         if flag != "-f":
             continue
@@ -7416,13 +7483,18 @@ def docker_compose_converge(service_ids: list[str]) -> tuple:
 
 
 def docker_compose_recreate(service_ids: list[str], *, force_recreate: bool = True) -> tuple:
-    """Force-recreate a set of allowed core services using the current compose stack."""
-    ok, error = validate_core_recreate_ids(service_ids)
-    if not ok:
-        return False, error
+    """Force-recreate a set of allowed core services using the current compose stack.
+
+    Pixel's model relay is no core service, but this agent recreates it on
+    its own when a remote-provider route change rewrites ODS_MODE.
+    """
+    if service_ids != [_PIXEL_MODEL_RELAY_CONTAINER.removeprefix("ods-")]:
+        ok, error = validate_core_recreate_ids(service_ids)
+        if not ok:
+            return False, error
 
     try:
-        flags = _core_recreate_compose_flags(resolve_compose_flags())
+        flags = _core_recreate_compose_flags(resolve_compose_flags(), service_ids)
     except (OSError, ValueError) as exc:
         return False, f"Could not resolve core Compose fragments: {exc}"
     cmd = (
@@ -7431,7 +7503,10 @@ def docker_compose_recreate(service_ids: list[str], *, force_recreate: bool = Tr
         + service_ids
     )
     compose_env = os.environ.copy()
-    for key in ("GGUF_FILE", "LLM_MODEL", "MAX_CONTEXT", "CTX_SIZE"):
+    # Compose prefers the caller's environment to .env. An agent started from
+    # a shell exported .env at that time, and a route change has since
+    # rewritten the route keys (remote-provider activation).
+    for key in ("GGUF_FILE", "LLM_MODEL", "MAX_CONTEXT", "CTX_SIZE", "ODS_MODE", "LLM_API_URL", "EXTERNAL_LLM_URL"):
         compose_env.pop(key, None)
     if "open-webui" in service_ids and _network_auth_required(load_env(INSTALL_DIR / ".env")):
         compose_env["WEBUI_AUTH"] = "true"
@@ -11409,14 +11484,14 @@ class AgentHandler(BaseHTTPRequestHandler):
         lock_acquired = False
         try:
             plan = _plan_remote_provider_lifecycle_operation(body)
-            if not _model_activate_lock.acquire(blocking=False):
+            lock_acquired, _active = _begin_model_lifecycle("remote_provider_apply")
+            if not lock_acquired:
                 json_response(
                     self,
                     409,
                     {"error": "A model or remote-provider activation is already in progress"},
                 )
                 return
-            lock_acquired = True
             result = _apply_remote_provider_lifecycle_operation(body, plan)
         except (_RemoteProviderLifecycleError, _RemoteProviderPolicyError) as exc:
             json_response(self, 400, {"error": str(exc)})
@@ -11441,7 +11516,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
         finally:
             if lock_acquired:
-                _model_activate_lock.release()
+                _end_model_lifecycle("remote_provider_apply")
         json_response(self, 200, result)
 
     def _handle_remote_provider_proof(self):
@@ -11453,17 +11528,26 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
         lock_acquired = False
         try:
-            if not _model_activate_lock.acquire(blocking=False):
+            lock_acquired, _active = _begin_model_lifecycle("remote_provider_proof")
+            if not lock_acquired:
                 json_response(
                     self,
                     409,
                     {"error": "A model or remote-provider activation is already in progress"},
                 )
                 return
-            lock_acquired = True
             result = _record_remote_provider_egress_probe(body)
         except ValueError as exc:
             json_response(self, 400, {"error": str(exc)})
+            return
+        except _RemoteProviderNotServing as exc:
+            # Not a busy lifecycle (409): the provider failed; nothing changed.
+            json_response(self, 502, {
+                "error": str(exc),
+                "code": "provider_not_serving",
+                "providerStatus": exc.provider_status,
+                "providerMessage": exc.provider_message,
+            })
             return
         except RuntimeError as exc:
             json_response(self, 409, {"error": str(exc)})
@@ -11474,7 +11558,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
         finally:
             if lock_acquired:
-                _model_activate_lock.release()
+                _end_model_lifecycle("remote_provider_proof")
         json_response(self, 200, result)
 
     def _handle_remote_provider_ssh_supervisor_status(self):
@@ -15523,6 +15607,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                         _pixel_image_input_readback(_pixel_model_image_input(model_id), final_runtime_proof),
                         profile_traits),
                 }
+                measured_control = (profile_traits or {}).get('control')
+                if measured_control in ('enable_thinking', 'always', 'none'):
+                    pixel_target['thinkingControl'] = measured_control
                 pixel_status = (pixel_transaction.apply(pixel_target) if pixel_transaction is not None
                     else _reconcile_ods_managed_pixel_model(
                         pixel_runtime_identity, int(context_length),
@@ -19675,6 +19762,103 @@ def _verify_litellm_route(env: dict, *, model: str = "default") -> None:
     raise RuntimeError(
         f"LiteLLM did not serve a completion through the active {model} route"
     )
+
+
+# A provider error that LiteLLM passes on can name the end of a refused key,
+# the key's hash or a rate-limited key's hash (pixel-model-relay/relay.py);
+# none may leave the agent.
+_PROVIDER_KEY_ECHO = (
+    (re.compile(r"(Received API Key\s*=\s*)[^,\s\"\\]+", re.IGNORECASE), r"\1[redacted]"),
+    (re.compile(r"(Key Hash \(Token\)\s*=\s*)[0-9A-Fa-f]+", re.IGNORECASE), r"\1[redacted]"),
+    (re.compile(r"(api_key\s*[:=]\s*)[^\s,\"']+", re.IGNORECASE), r"\1[redacted]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{6,}"), "[redacted]"),
+    (re.compile(r"\b[0-9A-Fa-f]{32,}\b"), "[redacted]"),
+)
+# LiteLLM's wrapper around a provider error, e.g. "litellm.InternalServerError:
+# InternalServerError: OpenAIException - Connection error."
+_LITELLM_ERROR_PREFIX = re.compile(r"^(?:litellm\.\w+:\s*)?(?:\w+Error:\s*)?(?:\w+Exception\s*-\s*)?")
+# LiteLLM got no HTTP answer from its own next hop (the egress): not the API.
+_LITELLM_OWN_FAULT = re.compile(r"^litellm\.APIConnectionError\b")
+
+
+def _provider_error_line(body: str) -> str:
+    """The first line of an error body's message, as LiteLLM wrote it."""
+    try:
+        value = json.loads(body)
+    except json.JSONDecodeError:
+        value = None
+    error = value.get("error") if isinstance(value, dict) else None
+    text = str((error.get("message") if isinstance(error, dict) else error if isinstance(error, str) else body) or "")
+    return text.strip().splitlines()[0] if text.strip() else ""
+
+
+def _provider_error_text(line: str) -> str:
+    """That line bounded, without key echoes, control characters or backslashes."""
+    for pattern, replacement in _PROVIDER_KEY_ECHO:
+        line = pattern.sub(replacement, line)
+    line = "".join(character for character in line if character.isprintable() and character != "\\")
+    return _LITELLM_ERROR_PREFIX.sub("", line).strip()[:300]
+
+
+def _litellm_ready(host: str, port: str) -> bool:
+    """LiteLLM's own readiness, which needs no provider answer."""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "--max-time", "5", "-w", "%{http_code}",
+             f"http://{host}:{port}/health/readiness"],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "200"
+
+
+def _litellm_route_failure(env: dict, *, model: str = "ods/current") -> tuple[int | None, str, bool] | None:
+    """Ask the active LiteLLM route for one completion.
+
+    Returns None when it answers. Otherwise returns the HTTP status (None when
+    LiteLLM itself did not answer), a bounded error text, and whether the
+    failure is the provider's, meaning LiteLLM and its egress hop worked.
+    """
+    host = "ods-litellm" if os.environ.get("ODS_HOST_INSTALL_DIR") else "127.0.0.1"
+    port = str(env.get("LITELLM_PORT") or "4000")
+    api_key = str(env.get("LITELLM_KEY") or env.get("LITELLM_MASTER_KEY") or "")
+    command = [
+        "curl", "-s", "--max-time", "30", "--max-filesize", "65536",
+        "-w", "\n%{http_code}", "-X", "POST", f"http://{host}:{port}/v1/chat/completions",
+        "-H", "Content-Type: application/json", "-H", "@-",
+        "-d", json.dumps(_completion_probe_payload(model, disable_thinking=False)),
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, encoding="utf-8", errors="replace", timeout=35,
+            # Keep the key out of process listings (see _chat_completion_ready).
+            input=f"Authorization: Bearer {api_key}\n",
+        )
+        timed_out = result.returncode == 28
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    if timed_out:
+        # LiteLLM took the request but no answer came: the API's slowness if
+        # LiteLLM itself still answers, else LiteLLM's own fault.
+        if _litellm_ready(host, port):
+            return 504, "The API did not answer within 30 seconds", True
+        return None, "LiteLLM did not answer in time", False
+    body, _, code = result.stdout.rpartition("\n")
+    if result.returncode != 0 or not code.isdigit() or code == "000":
+        return None, "LiteLLM did not answer", False
+    status = int(code)
+    if status == 200:
+        try:
+            response = json.loads(body)
+        except json.JSONDecodeError:
+            return status, "LiteLLM returned an invalid completion", False
+        if _completion_response_ready(response, require_visible_content=False):
+            return None
+        return status, "The API answered with an empty completion", True
+    line = _provider_error_line(body)
+    provider = (status >= 500 or status in {408, 429}) and not _LITELLM_OWN_FAULT.match(line)
+    return status, _provider_error_text(line) or f"HTTP {status}", provider
 
 
 def _read_hermes_container_config() -> str:

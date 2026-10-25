@@ -74,6 +74,7 @@ export default function Models({ compact = false }) {
     llmBackend,
     hostRuntime,
     externalApi,
+    activeRuntime,
     modelManagement,
     modelLifecycle,
     modelActivation,
@@ -108,6 +109,7 @@ export default function Models({ compact = false }) {
   const [speedFilter, setSpeedFilter] = useState('any')
   const [contextFloor, setContextFloor] = useState(0)
   const [deleteConfirmModel, setDeleteConfirmModel] = useState(null)
+  const [unloadConfirmOpen, setUnloadConfirmOpen] = useState(false)
   const [activationConfigModel, setActivationConfigModel] = useState(null)
   const [libraryScope, setLibraryScope] = useState('recommended')
   const libraryRef = useRef(null)
@@ -235,6 +237,8 @@ export default function Models({ compact = false }) {
 
   const activationBusy = Boolean(activationLoading || runtimeActionLoading || modelLifecycle?.active || modelRecoveryPending)
   const providerBusy = Boolean(modelLifecycle?.active && ['remote_provider_apply', 'remote_provider_proof'].includes(modelLifecycle.operation))
+  const activeRemoteRuntime = !activationBusy && activeRuntime?.source === 'remote-provider' ? activeRuntime : null
+  const remoteRouteActive = Boolean(activeRemoteRuntime)
   const visibleActivationModeError = providerBusy ? 'Wait for the model connection change to finish.' : activationModeError
   const handleConfirmActivation = async (contextLength) => {
     if (!activationConfigModel?.id || activationBusy) return
@@ -254,6 +258,18 @@ export default function Models({ compact = false }) {
   }
 
   const pendingModelActions = actionLoadingModels ?? (actionLoading ? [actionLoading] : [])
+  const runtimeControlsBusy = Boolean(runtimeActionLoading || activationLoading || modelLifecycle?.active || pendingModelActions.length || downloadProgress.isDownloading)
+  // Unloading stops Portal and Hermes until Resume, so it asks first. The
+  // question closes for good if the model stops or another operation starts.
+  const unloadAvailable = Boolean(modelManagement?.managed === true && modelManagement.canUnload === true
+    && modelManagement.running && !runtimeControlsBusy)
+  useEffect(() => {
+    if (!unloadAvailable) setUnloadConfirmOpen(false)
+  }, [unloadAvailable])
+  const handleConfirmUnload = async () => {
+    setUnloadConfirmOpen(false)
+    await stopRuntime()
+  }
   const visibleDownloadProgress = downloadProgress.progress || (downloadProgress.statusError && {
     status: 'error',
     error: downloadProgress.statusError,
@@ -264,7 +280,7 @@ export default function Models({ compact = false }) {
   })
   const retryModelId = catalogModelIdForProgress(models, visibleDownloadProgress?.model)
   const renderModel = model => <ModelTableRow key={model.id} compact={compact} model={model} gpu={gpu}
-    canActivateModels={canActivateModels} activationModeError={visibleActivationModeError} apiMode={llmBackend === 'external'}
+    canActivateModels={canActivateModels} activationModeError={visibleActivationModeError} apiMode={llmBackend === 'external'} remoteRouteActive={remoteRouteActive}
     hermesMinimumContext={hermesMinimumContext} pixelMinimumContext={pixelMinimumContext}
     isCurrentModel={model.id === currentModel} isLoading={pendingModelActions.includes(model.id)}
     loadBusy={pendingModelActions.length > 0} activationBusy={activationBusy}
@@ -292,7 +308,7 @@ export default function Models({ compact = false }) {
 
   return (
     <div className={compact ? 'models-refined' : 'p-3 sm:p-6 lg:p-8'}>
-      {compact ? <header className="models-toolbar"><h2>Your models</h2><button type="button" className="models-browse-link" onClick={() => { setLibraryScope('recommended'); libraryRef.current?.scrollIntoView?.({ block: 'start' }) }}>Browse {odsCatalogModels.length} {odsCatalogModels.length === 1 ? 'model' : 'models'} ↓</button><span>Runtime: {runtimeLabel(odsMode, configuredMode, externalApi)}</span><button className="pixel-metal-control" title="Refresh models" onClick={refresh}><MetalMetricIcon icon={RefreshCw} size={14}/></button></header> : <header className="mb-7 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+      {compact ? <header className="models-toolbar"><h2>Your models</h2><button type="button" className="models-browse-link" onClick={() => { setLibraryScope('recommended'); libraryRef.current?.scrollIntoView?.({ block: 'start' }) }}>Browse {odsCatalogModels.length} {odsCatalogModels.length === 1 ? 'model' : 'models'} ↓</button><span>Runtime: {runtimeLabel(odsMode, configuredMode, externalApi, activeRemoteRuntime)}</span><button className="pixel-metal-control" title="Refresh models" onClick={refresh}><MetalMetricIcon icon={RefreshCw} size={14}/></button></header> : <header className="mb-7 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           {!compact && <h1 className="text-2xl font-bold text-theme-text">Models</h1>}
           <p className="mt-1 text-sm text-theme-text-muted">
@@ -302,7 +318,7 @@ export default function Models({ compact = false }) {
 
         <div className="flex max-w-full flex-wrap items-center gap-2">
           <span className="inline-flex min-h-9 max-w-full items-center rounded-lg border border-theme-border bg-theme-bg/45 px-3 py-2 text-center text-xs font-medium text-theme-text-secondary">
-            Runtime: {runtimeLabel(odsMode, configuredMode, externalApi)}
+            Runtime: {runtimeLabel(odsMode, configuredMode, externalApi, activeRemoteRuntime)}
           </span>
           <button
             type="button"
@@ -333,7 +349,7 @@ export default function Models({ compact = false }) {
         </div>
       )}
 
-      {!providerBusy && !canActivateModels && !(modelManagement?.managed === true && modelManagement.running === false) && (
+      {!providerBusy && !activeRemoteRuntime && !canActivateModels && !(modelManagement?.managed === true && modelManagement.running === false) && (
         <section className={compact ? 'models-external-notice' : 'mb-5 flex flex-col gap-3 rounded-xl border border-theme-border bg-theme-text-secondary/10 p-4 sm:flex-row sm:items-center sm:justify-between'}>
           <div className="flex min-w-0 items-start gap-3">
             <AlertCircle size={18} className="mt-0.5 shrink-0 text-theme-text-secondary" />
@@ -370,8 +386,8 @@ export default function Models({ compact = false }) {
               <p role="status" className="mt-1 text-xs text-theme-text-secondary">{modelManagement.runtimeError}</p>
             )}
           </div>
-          <button type="button" onClick={modelManagement.running ? stopRuntime : startRuntime}
-            disabled={Boolean(runtimeActionLoading || activationLoading || modelLifecycle?.active || pendingModelActions.length || downloadProgress.isDownloading)}
+          <button type="button" onClick={modelManagement.running ? () => setUnloadConfirmOpen(true) : startRuntime}
+            disabled={runtimeControlsBusy}
             className="rounded-md border border-theme-border px-3 py-2 disabled:opacity-50">
             {runtimeActionLoading === 'stop' ? 'Unloading…' : runtimeActionLoading === 'start' ? (modelManagement.startRefusal ? 'Starting…' : 'Resuming…') : modelManagement.running ? 'Unload model' : modelManagement.startRefusal ? 'Start anyway' : 'Resume model'}
           </button>
@@ -384,6 +400,7 @@ export default function Models({ compact = false }) {
         currentModel={currentModel || loadedModel}
         gpu={gpu}
         externalApi={externalApi}
+        activeRuntime={activeRemoteRuntime}
         showProfile={canActivateModels}
         lifecycleActive={Boolean(modelLifecycle?.active || modelActivation?.active || activationLoading || runtimeActionLoading)}
       />
@@ -500,6 +517,12 @@ export default function Models({ compact = false }) {
           onConfirm={handleConfirmDelete}
         />
       )}
+      {unloadConfirmOpen && unloadAvailable && (
+        <UnloadModelDialog
+          onCancel={() => setUnloadConfirmOpen(false)}
+          onConfirm={handleConfirmUnload}
+        />
+      )}
       {activationConfigModel && (
         <ModelActivationDialog
           model={activationConfigModel}
@@ -517,8 +540,9 @@ export default function Models({ compact = false }) {
   )
 }
 
-function CurrentModelPanel({ model, currentModel, gpu, compact = false, externalApi = null, showProfile = false, lifecycleActive = false }) {
+function CurrentModelPanel({ model, currentModel, gpu, compact = false, externalApi = null, activeRuntime = null, showProfile = false, lifecycleActive = false }) {
   if (externalApi) return <ExternalApiPanel compact={compact} externalApi={externalApi} />
+  if (activeRuntime?.source === 'remote-provider') return <RemoteProviderPanel compact={compact} activeRuntime={activeRuntime} />
   const modelLabel = currentModel || model?.id
   const speed = getSpeedDisplay(model, gpu)
   const context = model ? formatContext(model.contextLength) : '--'
@@ -845,6 +869,7 @@ function ModelTableRow({
   canActivateModels,
   activationModeError,
   apiMode = false,
+  remoteRouteActive = false,
   hermesMinimumContext,
   pixelMinimumContext,
   isCurrentModel,
@@ -859,6 +884,7 @@ function ModelTableRow({
   onDelete,
 }) {
   const isLoaded = model.status === 'loaded' || isCurrentModel
+  const isLoadedLocally = isLoaded && remoteRouteActive
   const isDownloaded = model.status === 'downloaded'
   const isRuntimeManaged = model.metadata?.source === 'runtime'
   const memory = getMemoryMeta(model, gpu)
@@ -882,7 +908,7 @@ function ModelTableRow({
   const runNote = runDisabledReason || runWarning
 
   if (compact) return <article className="model-entry" aria-label={model.name}>
-    <header><span className="model-entry-symbol"><ModelPublisherIcon model={model} tone={iconTone}/></span><div><h3 title={model.name}>{model.name}</h3><span>{model.quantization || 'Quantization unspecified'}{model.size ? ` · ${model.size}` : ''}</span></div><span className={isLoaded ? 'models-live model-state' : 'model-state'}>{isLoaded ? 'Active' : isDownloaded ? 'Installed' : 'Available'}</span></header>
+    <header><span className="model-entry-symbol"><ModelPublisherIcon model={model} tone={iconTone}/></span><div><h3 title={model.name}>{model.name}</h3><span>{model.quantization || 'Quantization unspecified'}{model.size ? ` · ${model.size}` : ''}</span></div><span className={isLoaded && !isLoadedLocally ? 'models-live model-state' : 'model-state'}>{isLoadedLocally ? 'Loaded locally' : isLoaded ? 'Active' : isDownloaded ? 'Installed' : 'Available'}</span></header>
     <dl className="model-entry-metrics"><div><dt>Context</dt><dd>{formatContext(model.contextLength)}</dd></div><div><dt>VRAM estimate</dt><dd>{memory.value}</dd></div><div className="model-speed-reading"><dt>Speed</dt><dd>{speed.label}</dd></div></dl>
     <div className="model-fit"><span>{compatibility.label}</span><span>{compatibility.detail}</span></div>
     <footer><div className="model-entry-actions">
@@ -907,7 +933,8 @@ function ModelTableRow({
               {tags.map(tag => <Badge key={tag} subdued>{tag}</Badge>)}
               {performanceBadge && <Badge tone={performanceBadge.tone}>{performanceBadge.label}</Badge>}
               {model.recommended && !isLoaded && <Badge tone="amber">Selected install</Badge>}
-              {isLoaded && <Badge tone="green">Active</Badge>}
+              {isLoadedLocally && <Badge tone="green">Loaded locally</Badge>}
+              {isLoaded && !isLoadedLocally && <Badge tone="green">Active</Badge>}
             </div>
           </div>
         </div>
@@ -1159,6 +1186,52 @@ function DeleteModelDialog({ model, onCancel, onConfirm }) {
             className="inline-flex h-9 items-center justify-center rounded-md border border-red-300/30 bg-red-500/15 px-3 text-xs font-semibold text-red-200 transition-colors hover:border-red-200/50 hover:bg-red-500/25"
           >
             Delete model
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function UnloadModelDialog({ onCancel, onConfirm }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="unload-model-title"
+        aria-describedby="unload-model-detail"
+        className="w-full max-w-md rounded-xl border border-red-400/25 bg-theme-card p-5 shadow-[0_24px_80px_rgba(0,0,0,0.32)]"
+      >
+        <div className="flex items-start gap-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-red-300/20 bg-red-500/10 text-red-300">
+            <AlertCircle size={17} />
+          </div>
+          <div className="min-w-0">
+            <h2 id="unload-model-title" className="text-sm font-semibold text-theme-text">
+              Unload the model?
+            </h2>
+            <p id="unload-model-detail" className="mt-2 text-sm leading-5 text-theme-text-muted">
+              Portal and Hermes stop answering until you choose Resume model. Loading it again can take a few minutes.
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            autoFocus
+            className="inline-flex h-9 items-center justify-center rounded-md border border-theme-border bg-theme-bg/45 px-3 text-xs font-semibold text-theme-text-secondary transition-colors hover:border-theme-accent/35 hover:text-theme-text"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="inline-flex h-9 items-center justify-center rounded-md border border-red-300/30 bg-red-500/15 px-3 text-xs font-semibold text-red-200 transition-colors hover:border-red-200/50 hover:bg-red-500/25"
+          >
+            Unload model
           </button>
         </div>
       </div>
@@ -1692,9 +1765,23 @@ function ExternalApiPanel({ externalApi, compact = false }) {
   )
 }
 
-function runtimeLabel(odsMode, configuredMode, externalApi) {
+function runtimeLabel(odsMode, configuredMode, externalApi, activeRuntime = null) {
   if (externalApi) return externalApi.host ? `API (${externalApi.host})` : 'API'
+  if (activeRuntime?.source === 'remote-provider') return 'Model API'
   return `${formatModeLabel(odsMode)}${configuredMode !== odsMode ? ` / configured ${formatModeLabel(configuredMode)}` : ''}`
+}
+
+function RemoteProviderPanel({ compact = false, activeRuntime }) {
+  return (
+    <section className={compact ? 'models-active' : 'mb-4 rounded-xl border p-4'}
+      style={compact ? undefined : TECH_TILE_STYLE} aria-label="Model runtime">
+      <header><span className="models-live">Using a model API</span></header>
+      <div className="models-active-name"><MetalMetricIcon icon={Box} size={22}/><strong>{activeRuntime.model}</strong></div>
+      <dl><div><dt>Context</dt><dd>{formatContext(activeRuntime.contextLength)}</dd></div></dl>
+      <p className="mt-2 text-sm text-theme-text-secondary">Switch back to a local model in Model connections to use local model activation controls.</p>
+      <Link className="mt-2 inline-flex items-center gap-1 text-sm text-theme-accent" to="/settings?section=remote">Model connections <ChevronRight size={12}/></Link>
+    </section>
+  )
 }
 
 function formatModeLabel(mode) {

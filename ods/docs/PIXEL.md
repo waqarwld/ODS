@@ -41,17 +41,25 @@ model has equal intelligence or tool-use skill.
 ## Capability-aware bootstrap defaults
 
 ODS scopes the exact shipped `AGENTS.md` and `TOOLS.md` bootstrap defaults in
-memory before each Pixel run. Detailed Calendar and Frontier guidance is omitted
-only when their provider is explicitly disabled or every corresponding tool is
-explicitly denied. A tool deferred behind Tool Search remains enabled; Operations
-guidance and general authority, privacy, research and verification rules remain.
+memory before each Pixel run. Each file is recognized both as shipped, which is
+what the macOS install keeps, and as the Linux and WSL install leaves it: Pixel's
+apply rewrites both files with `scripts/migrate-workspace-source-boundary.mjs`
+before the first run, adding email, Calendar and social sections and a second
+status-tool step that are scoped the same way. Detailed email, Calendar and
+Frontier guidance, the Source Broker's tool notes, and the step that calls its
+`pixel_limb_status` tool are omitted only when their provider is explicitly
+disabled or every corresponding tool is explicitly denied. ODS's own Pixel
+configuration loads no Source Broker and denies all of its tools, so Pixel is not
+told about email or Calendar tools it does not have. A tool deferred behind Tool
+Search remains enabled; Operations guidance and general authority, privacy,
+research and verification rules remain.
 The personal development contract in the known vendor default is
 replaced with instructions to use this installation's configured model and tools.
 
 This does not edit workspace files or alter available tools. Owner-customized
 files, unknown template revisions, other agents, mismatched workspaces and disabled
 prompt hooks retain their original text. Capability changes are evaluated on the
-next bootstrap, so enabling Calendar or Frontier restores its detailed guidance.
+next bootstrap, so enabling email, Calendar or Frontier restores its detailed guidance.
 Reduced bootstrap text is not evidence of task quality or a measured speedup.
 
 ## Availability and runtime readiness

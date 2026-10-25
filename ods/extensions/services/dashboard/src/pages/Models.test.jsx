@@ -99,6 +99,60 @@ function renderModels() {
   return render(createElement(MemoryRouter, null, createElement(Models)))
 }
 
+test.each([false, true])('shows the live model API instead of the loaded local engine (compact=%s)', (compact) => {
+  useModelsMock.mockReturnValue(baseState({
+    odsMode: 'local', configuredMode: 'cloud', llmBackend: 'llama-server',
+    currentModel: 'qwen3.5-9b-q4', loadedModel: 'Qwen3.5-9B-Q4_K_M.gguf',
+    activeRuntime: {source: 'remote-provider', model: 'deepseek-v4.1-flash', contextLength: 409600},
+    canActivateModels: false, activationModeError: 'Local mode does not match configured cloud mode.',
+    models: [model({status: 'loaded'})],
+  }))
+  render(createElement(MemoryRouter, null, createElement(Models, {compact})))
+  const runtime = screen.getByRole('region', {name: 'Model runtime'})
+  expect(runtime).toHaveTextContent('Using a model API')
+  expect(runtime).toHaveTextContent('deepseek-v4.1-flash')
+  expect(runtime).toHaveTextContent('400K')
+  expect(runtime).not.toHaveTextContent('Qwen')
+  expect(within(runtime).getByRole('link', {name: 'Model connections'})).toHaveAttribute('href', '/settings?section=remote')
+  expect(screen.queryByText('Local model runtime unavailable')).toBeNull()
+  expect(screen.queryByText(/Runtime: Local/)).toBeNull()
+  expect(screen.getByText('Loaded locally')).toBeVisible()
+  expect(screen.queryByText('Active')).toBeNull()
+  expect(screen.getByRole('button', {name: 'Configure context for Qwen 3.5 9B'})).toBeDisabled()
+})
+
+test('keeps the local Active state when no active remote route is verified', () => {
+  useModelsMock.mockReturnValue(baseState({
+    currentModel: 'qwen3.5-9b-q4',
+    models: [model({status: 'loaded'})],
+  }))
+  renderModels()
+  expect(screen.queryByText('Loaded locally')).toBeNull()
+  expect(screen.getByText('Active')).toBeVisible()
+  expect(screen.getByRole('button', {name: 'Configure context for Qwen 3.5 9B'})).toBeEnabled()
+})
+
+test('keeps the existing diagnostic when no active remote route is verified', () => {
+  useModelsMock.mockReturnValue(baseState({
+    odsMode: 'local', configuredMode: 'cloud', llmBackend: 'llama-server', activeRuntime: null,
+    canActivateModels: false, activationModeError: 'Runtime status is unconfirmed.',
+  }))
+  renderModels()
+  expect(screen.queryByText('Using a model API')).toBeNull()
+  expect(screen.getByText('Runtime status is unconfirmed.')).toBeVisible()
+  expect(screen.getByText('Local model runtime unavailable')).toBeVisible()
+})
+
+test('does not present a previous model API as active during a connection change', () => {
+  useModelsMock.mockReturnValue(baseState({
+    activeRuntime: {source: 'remote-provider', model: 'deepseek-v4.1-flash', contextLength: 409600},
+    modelLifecycle: {active: true, operation: 'remote_provider_apply'}, canActivateModels: false,
+  }))
+  renderModels()
+  expect(screen.queryByText('Using a model API')).toBeNull()
+  expect(screen.getByText(/ODS is checking or changing the model connection/)).toBeVisible()
+})
+
 function confirmModelRun() {
   fireEvent.click(screen.getByRole('button', { name: 'Run model' }))
 }
@@ -246,9 +300,48 @@ test.each([true, false])('only managed runtimes expose unload/resume and hide ad
   renderModels()
   const button = screen.getByRole('button', { name: running ? 'Unload model' : 'Resume model' })
   fireEvent.click(button)
+  // Unloading asks first; Resume starts at once.
+  if (running) fireEvent.click(within(screen.getByRole('dialog', { name: 'Unload the model?' })).getByRole('button', { name: 'Unload model' }))
+  else expect(screen.queryByRole('dialog')).toBeNull()
   expect(running ? state.stopRuntime : state.startRuntime).toHaveBeenCalledOnce()
   expect(screen.queryByRole('button', { name: 'Adopt loaded model in ODS' })).toBeNull()
   if (!running) expect(screen.queryByText('Local model runtime unavailable')).toBeNull()
+})
+
+test('an open unload question closes for good when the model stops or another operation starts', () => {
+  const state = baseState({
+    models: [model({ status: 'loaded' })],
+    odsMode: 'local', configuredMode: 'local', llmBackend: 'llama-server', hostRuntime: true,
+    modelManagement: { managed: true, canActivate: true, canUnload: true, running: true },
+    stopRuntime: vi.fn(), startRuntime: vi.fn(),
+  })
+  useModelsMock.mockReturnValue(state)
+  const view = renderModels()
+  const show = (next, download = baseDownloadState()) => {
+    useModelsMock.mockReturnValue(next)
+    useDownloadProgressMock.mockReturnValue(download)
+    view.rerender(createElement(MemoryRouter, null, createElement(Models)))
+  }
+  const ask = () => {
+    fireEvent.click(within(screen.getByRole('region', { name: 'Model runtime controls' })).getByRole('button', { name: 'Unload model' }))
+    expect(screen.getByRole('dialog', { name: 'Unload the model?' })).toBeVisible()
+  }
+
+  // The model stopped elsewhere: nothing is left to unload.
+  ask()
+  show({ ...state, modelManagement: { ...state.modelManagement, canActivate: false, running: false } })
+  expect(screen.queryByRole('dialog')).toBeNull()
+  show(state)
+  expect(screen.queryByRole('dialog')).toBeNull()
+
+  // A download started elsewhere: the runtime controls wait for it.
+  ask()
+  show(state, baseDownloadState({ isDownloading: true }))
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(screen.getByRole('button', { name: 'Unload model' })).toBeDisabled()
+  show(state)
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(state.stopRuntime).not.toHaveBeenCalled()
 })
 
 test('a stopped runtime shows the launcher error, and a memory refusal turns Resume into Start anyway', () => {
